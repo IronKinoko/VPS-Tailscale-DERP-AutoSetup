@@ -32,11 +32,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-A
 如果 VPS 无法稳定访问 GitHub，不要在 VPS 上执行远程脚本。先在本地
 `git clone` 项目并整包上传：
 
+Linux/macOS：
+
 ```bash
 git clone https://github.com/bobvane/VPS-Tailscale-DERP-AutoSetup.git
 cd VPS-Tailscale-DERP-AutoSetup
 tar -czf /tmp/tderp-offline.tar.gz .
 scp /tmp/tderp-offline.tar.gz root@<VPS_IP>:/root/
+```
+
+Windows PowerShell：
+
+```powershell
+git clone https://github.com/bobvane/VPS-Tailscale-DERP-AutoSetup.git
+Set-Location .\VPS-Tailscale-DERP-AutoSetup
+tar -czf "$env:TEMP\tderp-offline.tar.gz" -C . .
+scp "$env:TEMP\tderp-offline.tar.gz" root@<VPS_IP>:/root/
 ```
 
 登录 VPS 后解压并运行离线入口：
