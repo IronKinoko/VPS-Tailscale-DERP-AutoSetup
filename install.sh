@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
 # tderp V2 — Tailscale DERP 一键安装 & 管理脚本
-# 版本: 3.3.0
+# 版本: 3.4.0
 #
 # 运行方式:
 #   bash <(curl -sL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-AutoSetup/main/install.sh)
 #   或直接运行 ./install.sh
+#   中国大陆网络受限时：上传完整项目后运行 sudo ./install-offline.sh
 #
 # 功能（设计文档需求 01-13 + G1-G9 全部实现）:
 #   - 一键安装 Docker 版 DERP（自建 ghcr.io 镜像供应链）
@@ -23,13 +24,22 @@ set -euo pipefail
 # ------------------------------------------------------------
 # 配置区
 # ------------------------------------------------------------
-VERSION="3.3.0"
+VERSION="3.4.0"
 INSTALL_DIR="/opt/tderp"
 ENV_FILE="${INSTALL_DIR}/tderp.env"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 BIN_LINK="/usr/local/bin/tderp"
 DATA_DIR="${INSTALL_DIR}/data"
 CERTS_DIR="${DATA_DIR}/certs"
+
+# 当前脚本路径。通过 bash <(curl ...) 运行时 BASH_SOURCE 不是普通文件，
+# 此时保持为空；离线入口会设置 TDERP_OFFLINE_DIR 提供本地脚本路径。
+SELF_SCRIPT_PATH=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SELF_SCRIPT_PATH="${_self_dir}/$(basename "${BASH_SOURCE[0]}")"
+  unset _self_dir
+fi
 
 # 项目仓库（用于 fork 说明）
 # fork 用户改这一处即可：镜像路径、脚本/compose 下载地址全部由它派生（红线 #2）
@@ -45,6 +55,58 @@ asset_urls() {
   echo "${GH_PROXY}/${raw}/${file}"
   echo "https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@main/${file}"
   echo "${raw}/${file}"
+}
+
+# 离线包由 install-offline.sh 通过 TDERP_OFFLINE_DIR 指向上传目录。
+# 只从该目录读资源，保证离线安装不会回退到 GitHub。
+local_asset_path() {
+  local file="${1:-}" path
+  [ -n "${TDERP_OFFLINE_DIR:-}" ] || return 1
+  [ -n "${file}" ] || return 1
+  path="${TDERP_OFFLINE_DIR}/${file}"
+  [ -f "${path}" ] || return 1
+  printf '%s\n' "${path}"
+}
+
+# 本地管理脚本优先取离线包，其次取当前正在执行的普通文件。
+local_install_script_path() {
+  local path
+  path="$(local_asset_path install.sh 2>/dev/null || true)"
+  if [ -n "${path}" ]; then
+    printf '%s\n' "${path}"
+    return 0
+  fi
+  if [ -n "${SELF_SCRIPT_PATH}" ] && [ -f "${SELF_SCRIPT_PATH}" ]; then
+    printf '%s\n' "${SELF_SCRIPT_PATH}"
+    return 0
+  fi
+  return 1
+}
+
+# 离线安装时 Docker 安装器也来自上传包；首次安装后复制到 /opt/tderp/vendor，
+# 使后续在管理菜单中重装 Docker 时仍不访问 get.docker.com。
+local_docker_install_script() {
+  local path="${TDERP_DOCKER_INSTALL_SCRIPT:-}"
+  if [ -n "${path}" ] && [ -f "${path}" ]; then
+    printf '%s\n' "${path}"
+    return 0
+  fi
+  path="$(local_asset_path vendor/get-docker.sh 2>/dev/null || true)"
+  if [ -n "${path}" ]; then
+    printf '%s\n' "${path}"
+    return 0
+  fi
+  path="${INSTALL_DIR}/vendor/get-docker.sh"
+  if [ -f "${path}" ]; then
+    printf '%s\n' "${path}"
+    return 0
+  fi
+  return 1
+}
+
+# 离线状态在首次安装时写入 tderp.env；管理脚本后续运行也能据此禁用 GitHub 更新。
+is_offline_install() {
+  [ -n "${TDERP_OFFLINE_DIR:-}" ] || [ "$(env_get OFFLINE_INSTALL)" = "true" ]
 }
 
 # 从 ghcr 包 tag 列表（stdin）挑出最高版本号 tag，忽略 latest / sha256- 摘要 tag。
@@ -99,8 +161,8 @@ C_BLUE="\033[34m"
 C_BOLD="\033[1m"
 C_DIM="\033[2m"
 
-# 非交互环境禁用颜色
-if [ ! -t 1 ]; then
+# 非交互或终端不支持 ANSI 时禁用颜色，避免输出原始转义字符。
+if [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ] || [ -n "${NO_COLOR:-}" ]; then
   C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BLUE=""; C_BOLD=""; C_DIM=""
 fi
 
@@ -233,15 +295,18 @@ msg() {
     case "$key" in
       docker_missing) echo "Docker not found, will auto-install..." ;;
       docker_menu) echo " Docker engine install method (choose by server location)" ;;
-      docker_cn) echo "  1. China server (Aliyun mirror, fast)" ;;
+      docker_cn) echo "  1. China server (bundled get-docker.sh + Aliyun mirror)" ;;
       docker_intl) echo "  2. International server (Docker official script)" ;;
       docker_manual) echo "  3. Manual (skip, I will install myself)" ;;
-      docker_choice) echo -n "Select [1-3] (default 2): " ;;
+      docker_choice) echo -n "Select [1-3] (default ${1:-2}): " ;;
       invalid_123) echo "Invalid input, enter 1, 2 or 3" ;;
       aliyun_install) echo "Installing Docker via Aliyun mirror..." ;;
-      aliyun_failed) echo "Aliyun mirror install failed, trying official script..." ;;
+      aliyun_local_install) echo "Installing Docker from the bundled script via Aliyun mirror..." ;;
+      aliyun_failed) echo "Aliyun installer failed, trying official script..." ;;
       docker_failed) echo "Docker install failed" ;;
       official_install) echo "Installing Docker via official script..." ;;
+      official_local_install) echo "Installing Docker from the bundled official script..." ;;
+      docker_local_script_missing) echo "Bundled get-docker.sh is missing; cannot install Docker in offline mode" ;;
       docker_skipped) echo "Skipped Docker install. Install manually and re-run this script." ;;
       docker_verify) echo "Verifying Docker..." ;;
       docker_installed) echo "Docker installed: $(docker --version)" ;;
@@ -389,8 +454,9 @@ msg() {
       install_docker_prompt) echo "Install Docker automatically?" ;;
       docker_retry) echo "Cancelled. Install Docker manually and retry." ;;
       compose_download_failed) echo "Failed to download compose template (all sources unreachable)" ;;
+      compose_local_failed) echo "Bundled docker-compose.yml is missing or invalid; cannot continue offline" ;;
       rollback_cleanup) echo "Rollback: cleaning config directory" ;;
-      compose_downloaded) echo "Compose template downloaded" ;;
+      compose_downloaded) echo "Compose template loaded" ;;
       compose_no_http_port) echo "HTTP port 80 not required; host port 80 mapping removed" ;;
       verify_socket) echo "Verify-clients enabled: tailscale socket mounted" ;;
       image_pull_failed) echo "Failed to pull image" ;;
@@ -417,6 +483,7 @@ msg() {
       tailscale_not_found) echo "tailscale not detected; install and log in manually" ;;
       logged_in_prompt) echo -n "  Is tailscale logged in? Press Enter to continue..." ;;
       register_script) echo "Downloading the management script from GitHub..." ;;
+      register_local_script) echo "Registering the local management script..." ;;
       register_failed) echo "Script download failed; manually download to ${1:-}/install.sh" ;;
       registered) echo "tderp command registered (${1:-})" ;;
       install_complete) echo "  Installation complete!" ;;
@@ -440,7 +507,7 @@ msg() {
       cert_cf_title) echo "  Cloudflare Origin CA — configuration" ;;
       cert_cf_1) echo "  1. The certificate was issued automatically through the Cloudflare API" ;;
       cert_cf_2) echo "     15-year validity; no port 80 or ICP filing is required" ;;
-      cert_cf_3) echo "  2. Clients trust the certificate directly; no extra ACL flag is required" ;;
+      cert_cf_3) echo "  2. Menu 7 pins the Origin CA leaf with CertName; Tailscale does not trust this CA by default" ;;
       cert_self_title) echo "  Self-signed certificate — configuration" ;;
       cert_self_1) echo "  1. No domain or port 80 is required" ;;
       cert_self_2) echo "  2. A 10-year certificate is generated on first startup" ;;
@@ -475,12 +542,13 @@ msg() {
       acl_copy_2) echo "Tailscale admin console -> Access Controls:" ;;
       acl_note_omit) echo "Note: OmitDefaultRegions=false keeps Tailscale official nodes as fallback; yours is preferred" ;;
       acl_secure_self) echo "Server uses a self-signed certificate; clients trust it via the CertName fingerprint (sha256-raw)" ;;
-      acl_secure_pending) echo "Server uses a self-signed certificate; it is not generated yet - finish installation first, then view the ACL config" ;;
-      acl_secure_cf) echo "Server uses a Cloudflare Origin CA certificate (clients trust it natively; no extra field needed)" ;;
+      acl_secure_pending) echo "Server uses a manual TLS certificate; it is not generated yet - finish installation first, then view the ACL config" ;;
+      acl_secure_cf) echo "Server uses a Cloudflare Origin CA certificate; clients trust it via the pinned CertName fingerprint (sha256-raw)" ;;
       acl_secure_le) echo "Server uses a Let's Encrypt certificate (clients trust it natively; no extra field needed)" ;;
       acl_not_installed) echo "Not installed or config missing" ;;
       acl_return) echo "Press Enter to return to menu..." ;;
-      first_run_download) echo "-> First run: downloading the management script..." ;;
+      first_run_download) echo "-> First run: preparing the management script..." ;;
+      first_run_local) echo "-> First run: registering the local management script..." ;;
       first_run_trying) echo "  Trying: ${1:-}" ;;
       first_run_registered) echo "tderp command registered; type tderp to manage" ;;
       first_run_failed) echo "Download failed; check your network and retry" ;;
@@ -498,7 +566,7 @@ msg() {
       help_uninstall) echo "  uninstall     full uninstall" ;;
       cf_title) echo " Cloudflare Origin CA certificate setup" ;;
       cf_desc1) echo " This mode issues an Origin CA certificate via the Cloudflare API" ;;
-      cf_desc2) echo " No port 80 and no ICP filing needed (clients trust it via the CertName fingerprint)" ;;
+      cf_desc2) echo " No port 80 and no ICP filing needed (menu 7 pins the Origin CA leaf via CertName)" ;;
       cf_token_title) echo " [Prepare a CF API Token]" ;;
       cf_token_step1) echo "  1. Open https://dash.cloudflare.com/profile/api-tokens" ;;
       cf_token_step2) echo "  2. Create Token -> Permissions: SSL and Certificates -> Edit" ;;
@@ -531,6 +599,7 @@ msg() {
       us_reload) echo "Press Enter to reload the menu..." ;;
       us_reenter) echo "Please exit and run tderp again to enter the menu (the new version will show)" ;;
       us_uptodate) echo "Already on the latest version v${1:-}; nothing to update" ;;
+      us_offline_disabled) echo "Offline installation: in-place script updates are disabled. Upload a newer project copy and run install-offline.sh again." ;;
       need_root) echo "Please run as root (sudo or root user)" ;;
       env_synced) echo "Synced ${1:-}/.env (with variable mapping)" ;;
       *) echo "$key" ;;
@@ -539,15 +608,18 @@ msg() {
     case "$key" in
       docker_missing) echo "检测到未安装 Docker，准备自动安装..." ;;
       docker_menu) echo " Docker 引擎安装方式（按你的服务器所在地选择）" ;;
-      docker_cn) echo "  1. 国内服务器（使用阿里云镜像源，速度快）" ;;
+      docker_cn) echo "  1. 国内服务器（本地 get-docker.sh + 阿里云镜像源）" ;;
       docker_intl) echo "  2. 国外服务器（使用 Docker 官方脚本）" ;;
       docker_manual) echo "  3. 手动安装（跳过，我自行安装）" ;;
-      docker_choice) echo -n "请选择 [1-3] (默认 2): " ;;
+      docker_choice) echo -n "请选择 [1-3] (默认 ${1:-2}): " ;;
       invalid_123) echo "输入无效，请输入 1、2 或 3" ;;
       aliyun_install) echo "使用阿里云镜像源安装 Docker..." ;;
-      aliyun_failed) echo "清华镜像源安装失败，尝试官方脚本..." ;;
+      aliyun_local_install) echo "使用本地 get-docker.sh + 阿里云镜像源安装 Docker..." ;;
+      aliyun_failed) echo "阿里云安装脚本失败，尝试官方脚本..." ;;
       docker_failed) echo "Docker 安装失败" ;;
       official_install) echo "使用 Docker 官方脚本安装..." ;;
+      official_local_install) echo "使用本地 Docker 官方脚本安装..." ;;
+      docker_local_script_missing) echo "离线包缺少 get-docker.sh，无法自动安装 Docker" ;;
       docker_skipped) echo "跳过 Docker 安装。请手动安装后重新运行此脚本。" ;;
       docker_verify) echo "验证 Docker..." ;;
       docker_installed) echo "Docker 安装成功: $(docker --version)" ;;
@@ -696,6 +768,7 @@ msg() {
       install_docker_prompt) echo "是否自动安装 Docker？" ;;
       docker_retry) echo "已取消，请手动安装 Docker 后重试" ;;
       compose_download_failed) echo "下载 compose 模板失败（多源均不可达）" ;;
+      compose_local_failed) echo "离线包内的 docker-compose.yml 缺失或无效，无法继续" ;;
       rollback_cleanup) echo "回滚：清理配置目录" ;;
       compose_downloaded) echo "compose 模板已获取" ;;
       compose_no_http_port) echo "无需 80 端口，已移除宿主机 80 端口映射" ;;
@@ -724,6 +797,7 @@ msg() {
       tailscale_not_found) echo "未检测到 tailscale，请手动安装并登录" ;;
       logged_in_prompt) echo "  tailscale 已登录？（回车继续）..." ;;
       register_script) echo "通过 GitHub 下载安装脚本..." ;;
+      register_local_script) echo "使用本地管理脚本..." ;;
       register_failed) echo "下载安装脚本失败，可手动下载到 ${1:-}/install.sh" ;;
       registered) echo "tderp 命令已注册（${1:-}）" ;;
       install_complete) echo "  ✅ 安装完成！" ;;
@@ -747,7 +821,7 @@ msg() {
       cert_cf_title) echo "  【Cloudflare Origin CA — 配置说明】" ;;
       cert_cf_1) echo "  1. 已通过 CF API 自动签发证书" ;;
       cert_cf_2) echo "     有效期 15 年，无需开放 80 端口，无需备案" ;;
-      cert_cf_3) echo "  2. 客户端直接信任证书，无需额外 ACL 标记" ;;
+      cert_cf_3) echo "  2. 菜单 7 会将 Origin CA 叶子证书写入 CertName；Tailscale 默认不信任该 CA" ;;
       cert_self_title) echo "  【自签名证书 — 配置说明】" ;;
       cert_self_1) echo "  1. 无需域名、无需开放 80 端口" ;;
       cert_self_2) echo "  2. 首次启动时自动生成有效期 10 年的证书" ;;
@@ -782,12 +856,13 @@ msg() {
       acl_copy_2) echo "Access Controls 里的整个配置：" ;;
       acl_note_omit) echo "提示：OmitDefaultRegions=false 保留 Tailscale 官方节点作兜底，你的节点优先使用" ;;
       acl_secure_self) echo "服务器使用自签名证书，客户端通过 CertName 指纹(sha256-raw)信任该证书" ;;
-      acl_secure_pending) echo "服务器使用自签名证书；证书尚未生成，请先完成安装后再查看 ACL 配置" ;;
-      acl_secure_cf) echo "服务器使用 Cloudflare Origin CA 证书（客户端原生信任，无需额外字段）" ;;
+      acl_secure_pending) echo "服务器使用 manual 证书；证书尚未生成，请先完成安装后再查看 ACL 配置" ;;
+      acl_secure_cf) echo "服务器使用 Cloudflare Origin CA 证书，客户端通过 CertName 固定叶子证书指纹(sha256-raw)认证" ;;
       acl_secure_le) echo "服务器使用 Let's Encrypt 证书，客户端原生信任，无需额外字段" ;;
       acl_not_installed) echo "未安装或配置缺失" ;;
       acl_return) echo "按回车返回菜单..." ;;
-      first_run_download) echo "→ 首次运行，下载安装脚本到本地..." ;;
+      first_run_download) echo "→ 首次运行，准备管理脚本..." ;;
+      first_run_local) echo "→ 首次运行，使用本地上传的管理脚本..." ;;
       first_run_trying) echo "  尝试: ${1:-}" ;;
       first_run_registered) echo "tderp 命令已注册，输入 tderp 即可管理" ;;
       first_run_failed) echo "下载失败，请检查网络后重试" ;;
@@ -805,7 +880,7 @@ msg() {
       help_uninstall) echo "  uninstall     完全卸载" ;;
       cf_title) echo " Cloudflare Origin CA 证书配置" ;;
       cf_desc1) echo " 本模式通过 Cloudflare API 签发 Origin CA 证书" ;;
-      cf_desc2) echo " 优点：无需开放 80 端口、无需备案（客户端通过 CertName 指纹信任自签证书）" ;;
+      cf_desc2) echo " 优点：无需开放 80 端口、无需备案（菜单 7 通过 CertName 固定 Origin CA 叶子证书）" ;;
       cf_token_title) echo " 【准备 CF API Token】" ;;
       cf_token_step1) echo "  1. 打开 https://dash.cloudflare.com/profile/api-tokens" ;;
       cf_token_step2) echo "  2. 创建 Token → 权限: SSL and Certificates → Edit" ;;
@@ -838,6 +913,7 @@ msg() {
       us_reload) echo "按回车重新加载菜单..." ;;
       us_reenter) echo "请退出后重新输入 tderp 进入菜单（将显示新版本）" ;;
       us_uptodate) echo "当前已是最新版本 v${1:-}，无需更新" ;;
+      us_offline_disabled) echo "当前为离线安装，已禁用在线脚本更新。请重新上传新版本项目并运行 install-offline.sh。" ;;
       need_root) echo "请以 root 权限运行（sudo 或 root 用户）" ;;
       env_synced) echo "已同步 ${1:-}/.env（含变量映射）" ;;
       *) echo "$key" ;;
@@ -1128,6 +1204,10 @@ version_gt() {
 # ============================================================
 install_docker_engine() {
   _info "$(msg docker_missing)"
+  local default_choice=2
+  if is_offline_install; then
+    default_choice=1
+  fi
   echo ""
   echo "----------------------------------------------"
   echo "$(msg docker_menu)"
@@ -1138,25 +1218,43 @@ install_docker_engine() {
   echo "----------------------------------------------"
   local choice
   while true; do
-    read -r -p "$(msg docker_choice)" choice
-    [ -z "$choice" ] && choice=2
+    read -r -p "$(msg docker_choice "${default_choice}")" choice
+    [ -z "$choice" ] && choice="${default_choice}"
     case "$choice" in
       1|2|3) break ;;
       *) _warn "$(msg invalid_123)" ;;
     esac
   done
 
+  local docker_script=""
+  docker_script="$(local_docker_install_script 2>/dev/null || true)"
   case "$choice" in
     1)
-      _info "$(msg aliyun_install)"
-      bash <(curl -sSL https://mirrors.aliyun.com/docker-ce/linux/install.sh) || {
-        _error "$(msg aliyun_failed)"
-        bash <(curl -sSL https://get.docker.com) || { _error "$(msg docker_failed)"; return 1; }
-      }
+      if [ -n "${docker_script}" ]; then
+        _info "$(msg aliyun_local_install)"
+        sh "${docker_script}" --mirror Aliyun || { _error "$(msg docker_failed)"; return 1; }
+      elif is_offline_install; then
+        _error "$(msg docker_local_script_missing)"
+        return 1
+      else
+        _info "$(msg aliyun_install)"
+        bash <(curl -sSL https://mirrors.aliyun.com/docker-ce/linux/install.sh) || {
+          _error "$(msg aliyun_failed)"
+          bash <(curl -sSL https://get.docker.com) || { _error "$(msg docker_failed)"; return 1; }
+        }
+      fi
       ;;
     2)
-      _info "$(msg official_install)"
-      curl -fsSL https://get.docker.com | bash || { _error "$(msg docker_failed)"; return 1; }
+      if [ -n "${docker_script}" ]; then
+        _info "$(msg official_local_install)"
+        sh "${docker_script}" || { _error "$(msg docker_failed)"; return 1; }
+      elif is_offline_install; then
+        _error "$(msg docker_local_script_missing)"
+        return 1
+      else
+        _info "$(msg official_install)"
+        curl -fsSL https://get.docker.com | bash || { _error "$(msg docker_failed)"; return 1; }
+      fi
       ;;
     3)
       _warn "$(msg docker_skipped)"
@@ -1682,6 +1780,16 @@ install_derp() {
   chmod 700 "${CERTS_DIR}"
   _ok "$(msg dirs_created "${INSTALL_DIR}")"
 
+  if is_offline_install; then
+    local bundled_docker_script
+    bundled_docker_script="$(local_docker_install_script 2>/dev/null || true)"
+    if [ -n "${bundled_docker_script}" ]; then
+      mkdir -p "${INSTALL_DIR}/vendor"
+      cp -f "${bundled_docker_script}" "${INSTALL_DIR}/vendor/get-docker.sh"
+      chmod 644 "${INSTALL_DIR}/vendor/get-docker.sh"
+    fi
+  fi
+
   env_set "LANG" "${LANG}"
   env_set "DERP_IMAGE" "${DERP_IMAGE}"
   env_set "DERP_DOMAIN" "${DERP_DOMAIN}"
@@ -1693,22 +1801,36 @@ install_derp() {
   env_set "VERIFY_CLIENTS" "${VERIFY_CLIENTS}"
   env_set "PUBLIC_IP" "${PUBLIC_IP:-}"
   env_set "INSTALLED_VERSION" "${VERSION}"
+  if is_offline_install; then
+    env_set "OFFLINE_INSTALL" "true"
+  fi
   # tderp.env 收紧 600——可能含敏感标记（CERT_CF、CERT_MODE 等）。
   # 注意：CF API Token 不会写入此文件（仅局部变量，签完即丢），但保持 600 习惯性安全。
   chmod 600 "${ENV_FILE}" 2>/dev/null || true
   _ok "$(msg config_written "${ENV_FILE}")"
 
-  # 下载 compose 模板
+  # 获取 compose 模板：离线包只读本地上传文件，绝不回退 GitHub。
   _step 7 11 "$(t step_install_7)"
   local compose_ok=0
-  for u in $(asset_urls docker-compose.yml); do
-    if curl -fsSL --max-time 15 "${u}" -o "${COMPOSE_FILE}" 2>/dev/null && [ -s "${COMPOSE_FILE}" ]; then
-      compose_ok=1
-      break
-    fi
-  done
+  local compose_source=""
+  compose_source="$(local_asset_path docker-compose.yml 2>/dev/null || true)"
+  if [ -n "${compose_source}" ]; then
+    cp -f "${compose_source}" "${COMPOSE_FILE}"
+    [ -s "${COMPOSE_FILE}" ] && compose_ok=1
+  elif ! is_offline_install; then
+    for u in $(asset_urls docker-compose.yml); do
+      if curl -fsSL --max-time 15 "${u}" -o "${COMPOSE_FILE}" 2>/dev/null && [ -s "${COMPOSE_FILE}" ]; then
+        compose_ok=1
+        break
+      fi
+    done
+  fi
   if [ "${compose_ok}" != "1" ]; then
-    _error "$(msg compose_download_failed)"
+    if is_offline_install; then
+      _error "$(msg compose_local_failed)"
+    else
+      _error "$(msg compose_download_failed)"
+    fi
     _warn "$(msg rollback_cleanup)"
     rm -rf "${INSTALL_DIR}"
     return 1
@@ -1811,20 +1933,27 @@ install_derp() {
 
   # 注册 tderp 命令
   _step 11 11 "$(t step_install_11)"
-  # bash <(curl ...) 时 $0 是 pipe，cp 会失败，需 fallback 到 GitHub 下载
-  if [ ! -f "${INSTALL_DIR}/install.sh" ]; then
-      _info "$(msg register_script)"
-      # 尝试国内加速，失败用官方 raw
-      local u
-      for u in $(asset_urls install.sh); do
-        curl -sSL --max-time 30 -o "${INSTALL_DIR}/install.sh" "${u}" 2>/dev/null \
-          && [ -s "${INSTALL_DIR}/install.sh" ] && break
-      done
-      [ -s "${INSTALL_DIR}/install.sh" ] || _warn "$(msg register_failed "${INSTALL_DIR}")"
+  # 本地包优先复制本地上传/当前执行的 install.sh；只有在线模式且本地不可用时才访问 GitHub。
+  local bundled_install_script=""
+  bundled_install_script="$(local_install_script_path 2>/dev/null || true)"
+  if [ -n "${bundled_install_script}" ]; then
+    _info "$(msg register_local_script)"
+    if [ ! "${bundled_install_script}" -ef "${INSTALL_DIR}/install.sh" ] 2>/dev/null; then
+      cp -f "${bundled_install_script}" "${INSTALL_DIR}/install.sh"
     fi
-    chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
-    ln -sf "${INSTALL_DIR}/install.sh" "${BIN_LINK}" 2>/dev/null || true
-    _ok "$(msg registered "${BIN_LINK}")"
+  elif [ ! -f "${INSTALL_DIR}/install.sh" ]; then
+    _info "$(msg register_script)"
+    # 尝试国内加速，失败用官方 raw
+    local u
+    for u in $(asset_urls install.sh); do
+      curl -sSL --max-time 30 -o "${INSTALL_DIR}/install.sh" "${u}" 2>/dev/null \
+        && [ -s "${INSTALL_DIR}/install.sh" ] && break
+    done
+    [ -s "${INSTALL_DIR}/install.sh" ] || _warn "$(msg register_failed "${INSTALL_DIR}")"
+  fi
+  chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
+  ln -sf "${INSTALL_DIR}/install.sh" "${BIN_LINK}" 2>/dev/null || true
+  _ok "$(msg registered "${BIN_LINK}")"
 
     echo ""
     echo -e "  ${C_BOLD}${C_GREEN}╭──────────────────────────────────────────╮${C_RESET}"
@@ -1887,6 +2016,13 @@ show_status_line() {
 # ============================================================
 # 主菜单
 # ============================================================
+menu_item() {
+  local key="$1" text_key="$2" text
+  text="$(t "${text_key}")"
+  text="${text#*. }"
+  printf '  %b%s%b %s\n' "${C_BOLD}${C_CYAN}" "${key}." "${C_RESET}" "${text}"
+}
+
 show_menu() {
   clear 2>/dev/null || true
   echo ""
@@ -1899,18 +2035,18 @@ show_menu() {
   echo ""
   echo -e "  ${C_DIM}─────────────────────────────────────────────${C_RESET}"
   echo ""
-  echo "  ${C_BOLD}${C_CYAN}1.${C_RESET} $(t opt_lang | sed 's/^1. //')"
-  echo "  ${C_BOLD}${C_CYAN}2.${C_RESET} $(t opt_install | sed 's/^2. //')"
-  echo "  ${C_BOLD}${C_CYAN}3.${C_RESET} $(t opt_logs | sed 's/^3. //')"
-  echo "  ${C_BOLD}${C_CYAN}4.${C_RESET} $(t opt_restart | sed 's/^4. //')"
-  echo "  ${C_BOLD}${C_CYAN}5.${C_RESET} $(t opt_stop | sed 's/^5. //')"
-  echo "  ${C_BOLD}${C_CYAN}6.${C_RESET} $(t opt_update | sed 's/^6. //')"
-  echo "  ${C_BOLD}${C_CYAN}7.${C_RESET} $(t opt_acl | sed 's/^7. //')"
-  echo "  ${C_BOLD}${C_CYAN}8.${C_RESET} $(t opt_uninstall | sed 's/^8. //')"
-  echo "  ${C_BOLD}${C_CYAN}9.${C_RESET} $(t opt_bbr | sed 's/^9. //')"
-  echo "  ${C_BOLD}${C_CYAN}d.${C_RESET} $(t opt_dns | sed 's/^d. //')"
-  echo "  ${C_BOLD}${C_CYAN}u.${C_RESET} $(t opt_updatescript | sed 's/^u. //')"
-  echo "  ${C_BOLD}${C_CYAN}0.${C_RESET} $(t opt_exit | sed 's/^0. //')"
+  menu_item "1" "opt_lang"
+  menu_item "2" "opt_install"
+  menu_item "3" "opt_logs"
+  menu_item "4" "opt_restart"
+  menu_item "5" "opt_stop"
+  menu_item "6" "opt_update"
+  menu_item "7" "opt_acl"
+  menu_item "8" "opt_uninstall"
+  menu_item "9" "opt_bbr"
+  menu_item "d" "opt_dns"
+  menu_item "u" "opt_updatescript"
+  menu_item "0" "opt_exit"
   echo ""
 }
 
@@ -2103,6 +2239,12 @@ menu_update() {
 # 菜单操作 u: 更新 tderp 管理脚本（需求）
 # ============================================================
 menu_update_script() {
+  if is_offline_install; then
+    _warn "$(msg us_offline_disabled)"
+    read -r -p "$(msg press_return)"
+    return 0
+  fi
+
   _info "$(msg us_checking "${VERSION}")"
   mkdir -p "${INSTALL_DIR}"
 
@@ -2193,24 +2335,30 @@ menu_acl() {
 
   # 证书模式决定 derpMap 节点如何被客户端信任
   # 注意：InsecureForTests 是 Tailscale 测试专用标志（官方明确"用户不应设置"），
-  # 自签证书的正确做法是把证书 SHA256 指纹写入 CertName: "sha256-raw:<fp>"，
-  # 客户端据此指纹信任该自签证书（官方推荐机制，兼容纯 IP SAN）。
+  # manual 模式的证书（自签或 CF Origin CA）都通过 CertName: "sha256-raw:<fp>"
+  # 固定叶子证书；LE 使用公共信任链，不需要 CertName。
   local cert_mode cert_cf cert_fp cert_field secure_line
   cert_mode="$(env_get CERT_MODE)"
   cert_cf="$(env_get CERT_CF)"
   cert_field=""
-  if [ "${cert_mode}" = "manual" ] && [ "${cert_cf:-}" != "true" ]; then
+  if [ "${cert_mode}" = "manual" ]; then
     local certfile="${INSTALL_DIR}/data/certs/${domain}.crt"
     if [ -f "${certfile}" ]; then
       cert_fp=$(openssl x509 -in "${certfile}" -noout -fingerprint -sha256 2>/dev/null \
         | sed 's/^[^=]*=//; s/://g' | tr 'A-F' 'a-f')
-      cert_field="            \"CertName\": \"sha256-raw:${cert_fp}\""
-      secure_line="$(msg acl_secure_self)"
+      if [ -n "${cert_fp}" ]; then
+        cert_field="            \"CertName\": \"sha256-raw:${cert_fp}\""
+        if [ "${cert_cf:-}" = "true" ]; then
+          secure_line="$(msg acl_secure_cf)"
+        else
+          secure_line="$(msg acl_secure_self)"
+        fi
+      else
+        secure_line="$(msg acl_secure_pending)"
+      fi
     else
       secure_line="$(msg acl_secure_pending)"
     fi
-  elif [ "${cert_cf:-}" = "true" ]; then
-    secure_line="$(msg acl_secure_cf)"
   else
     secure_line="$(msg acl_secure_le)"
   fi
@@ -2570,28 +2718,35 @@ main() {
   # 不管是否已安装，只要 tderp 链接不存在就尝试创建
   if [ ! -L "${BIN_LINK}" ]; then
     mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
-    # 删除旧脚本，确保下载最新版
-    rm -f "${INSTALL_DIR}/install.sh"
-    echo "$(msg first_run_download)"
-    # 多源全部下载，取版本号最大的（与 menu_update_script 一致）
-    local best_ver=""
-    for url in $(asset_urls install.sh); do
-      local tmpf="${INSTALL_DIR}/install.sh.tmp.${RANDOM}"
-      echo "$(msg first_run_trying "${url}")"
-      if curl -sSL --max-time 20 -o "${tmpf}" "${url}" 2>/dev/null && [ -s "${tmpf}" ] && bash -n "${tmpf}" 2>/dev/null; then
-        local ver
-        ver="$(grep '^VERSION=' "${tmpf}" | head -1 | cut -d'=' -f2 | tr -d '"')"
-        if [ -n "${ver}" ] && { [ -z "${best_ver}" ] || version_gt "${ver}" "${best_ver}"; }; then
-          rm -f "${INSTALL_DIR}/install.sh"
-          mv -f "${tmpf}" "${INSTALL_DIR}/install.sh"
-          best_ver="${ver}"
+    local bundled_install_script=""
+    bundled_install_script="$(local_install_script_path 2>/dev/null || true)"
+    if [ -n "${bundled_install_script}" ]; then
+      echo "$(msg first_run_local)"
+      rm -f "${INSTALL_DIR}/install.sh"
+      cp -f "${bundled_install_script}" "${INSTALL_DIR}/install.sh"
+    else
+      # 在线模式：多源下载，取版本号最大的（与 menu_update_script 一致）
+      rm -f "${INSTALL_DIR}/install.sh"
+      echo "$(msg first_run_download)"
+      local best_ver=""
+      for url in $(asset_urls install.sh); do
+        local tmpf="${INSTALL_DIR}/install.sh.tmp.${RANDOM}"
+        echo "$(msg first_run_trying "${url}")"
+        if curl -sSL --max-time 20 -o "${tmpf}" "${url}" 2>/dev/null && [ -s "${tmpf}" ] && bash -n "${tmpf}" 2>/dev/null; then
+          local ver
+          ver="$(grep '^VERSION=' "${tmpf}" | head -1 | cut -d'=' -f2 | tr -d '"')"
+          if [ -n "${ver}" ] && { [ -z "${best_ver}" ] || version_gt "${ver}" "${best_ver}"; }; then
+            rm -f "${INSTALL_DIR}/install.sh"
+            mv -f "${tmpf}" "${INSTALL_DIR}/install.sh"
+            best_ver="${ver}"
+          else
+            rm -f "${tmpf}"
+          fi
         else
-          rm -f "${tmpf}"
+          rm -f "${tmpf}" 2>/dev/null || true
         fi
-      else
-        rm -f "${tmpf}" 2>/dev/null || true
-      fi
-    done
+      done
+    fi
     if [ -f "${INSTALL_DIR}/install.sh" ]; then
       chmod +x "${INSTALL_DIR}/install.sh"
       ln -sf "${INSTALL_DIR}/install.sh" "${BIN_LINK}"

@@ -38,6 +38,20 @@
 
 ---
 
+## 2.1 离线包模式（v3.4.0）
+
+为无法稳定访问 GitHub 的中国大陆 VPS 增加整包上传路径：
+
+- `install-offline.sh` 必须从上传后的普通文件执行，拒绝管道运行
+- 安装前检查 `install.sh`、`docker-compose.yml`、`vendor/get-docker.sh` 的文件名和数量是否齐全
+- 设置 `TDERP_OFFLINE_DIR` 后，`install.sh` 的 compose 和管理脚本均只读取上传目录
+- `vendor/get-docker.sh` 是官方脚本快照；国内 Docker 安装使用 `--mirror Aliyun`
+- `OFFLINE_INSTALL=true` 写入 `tderp.env`，后续菜单 `u` 明确禁用 GitHub 脚本更新
+
+离线模式解决的是 GitHub 可达性问题，不替代 ghcr.io 镜像自动拉取；安装时仍需按菜单选择可用的 ghcr 加速前缀。
+
+---
+
 ## 3. 安装流程（12 步）
 
 1. 镜像源选择（直连 ghcr.io / 国内加速 / 自定义）
@@ -63,7 +77,7 @@
 |------|------|---------|----------------|------|
 | Let's Encrypt（域名） | 需要 | 需要 | 原生信任 | 国外 / 国内已备案域名 |
 | 自签名（域名或纯 IP） | 不需要 | 不需要 | `CertName: "sha256-raw:<指纹>"` | **无域名用户推荐** |
-| Cloudflare Origin CA | 需要（CF 托管） | 不需要 | 原生信任 | 国内 VPS + CF 域名推荐 |
+| Cloudflare Origin CA | 需要（CF 托管） | 不需要 | `CertName: "sha256-raw:<指纹>"` | 国内 VPS + CF 域名推荐 |
 
 ### 4.1 纯 IP 模式的真相（重要）
 
@@ -79,15 +93,20 @@
 - entrypoint.sh 检测 `DERP_DOMAIN` 为 IP 时，用 `subjectAltName=IP:<ip>` 生成自签证书
 - derper 以 `-hostname <ip> -certmode manual` 运行
 
-### 4.2 自签证书客户端信任：CertName 机制（v3.1.0 修正）
+### 4.2 manual 证书客户端信任：CertName 机制（v3.1.0 修正）
 
 旧版在 derpMap 节点写 `"InsecureForTests": true`。**该字段是 Tailscale 测试专用标志，官方明确「用户不应设置」**，且新版 tailcfg 已不再推荐。
 
-v3.1.0 改为官方推荐的 **CertName 指纹机制**：
+v3.1.0 改为官方推荐的 **CertName 指纹机制**，同时适用于自签名证书和
+Cloudflare Origin CA 证书：
 
-- 自签证书生成后，脚本计算其 SHA256 指纹（64 位小写 hex）
+- 证书生成后，脚本计算叶子证书的 SHA256 指纹（64 位小写 hex）
 - 在 derpMap 节点写入 `"CertName": "sha256-raw:<指纹>"`
-- 客户端据此指纹信任该自签证书，无需关闭 TLS 校验
+- 客户端据此指纹信任该证书，无需关闭 TLS 校验
+
+Cloudflare Origin CA 不属于浏览器、操作系统或 Tailscale 的默认公共信任链。
+它的典型用途是 Cloudflare 边缘节点到源站之间的 TLS；Tailscale 客户端仍
+需要 `CertName` 固定叶子证书指纹。
 
 menu_acl（菜单 7）自动完成上述计算与输出，用户复制即可。
 
@@ -117,7 +136,8 @@ menu_acl（菜单 7）自动完成上述计算与输出，用户复制即可。
 }
 ```
 
-> CF Origin CA / Let's Encrypt 证书由公共 CA 签发，客户端原生信任，**derpMap 节点无需任何额外字段**。
+> Let's Encrypt 证书由公共 CA 签发，客户端原生信任，derpMap 节点无需额外字段。
+> CF Origin CA 必须保留 `CertName` 指纹字段。
 
 ---
 
@@ -163,7 +183,7 @@ menu_acl（菜单 7）自动完成上述计算与输出，用户复制即可。
 菜单 7（`tderp acl`）输出完整 tailnet policy 片段：
 
 - 自动读取 `DERP_DOMAIN` / `DERP_PORT` / `STUN_PORT` / `PUBLIC_IP` / `CERT_MODE`
-- 自签证书自动计算并嵌入 `CertName` 指纹
+- manual 证书（自签或 CF Origin CA）自动计算并嵌入 `CertName` 指纹
 - `OmitDefaultRegions: false` 保留官方节点兜底
 
 复制整体替换 Tailscale 后台 Access Controls 即可。`tailscale netcheck` 验证延迟。

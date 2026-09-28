@@ -6,7 +6,7 @@
 # 支持证书模式（继承设计文档需求 11）:
 #   1. letsencrypt(域名)   — derper 自动申请 LE 证书（需域名 + 80 端口）
 #   2. manual(自签名)      — 无证书时用 openssl 生成自签名；DERP_DOMAIN 为 IP 时自动用 IP SAN
-#   注：Tailscale 官方 derper 不支持 Let's Encrypt 纯 IP 证书，纯 IP 场景统一走自签名(IP SAN) + 客户端 InsecureForTests
+#   注：Tailscale 官方 derper 不支持 Let's Encrypt 纯 IP 证书，纯 IP 场景统一走自签名(IP SAN) + 客户端 CertName 指纹
 #
 # v3.2.5 变更:
 #   - DERP_DOMAIN 必填 + 字符白名单（防证书文件名/参数解析异常）

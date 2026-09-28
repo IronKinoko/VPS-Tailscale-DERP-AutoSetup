@@ -29,8 +29,11 @@ jobs:
           tar -xzf /tmp/bats.tar.gz -C /tmp
           sudo /tmp/bats-core-${BATS_VER}/install.sh /usr/local
 
-      - name: Run shellcheck on install.sh
-        run: shellcheck --severity=warning install.sh
+      - name: Verify offline bundle layout
+        run: bash install-offline.sh --verify-only
+
+      - name: Run shellcheck on installer scripts
+        run: shellcheck --severity=warning install.sh install-offline.sh
 
       - name: Guard against hardcoded CF token placeholder
         # 防止 Bearer *** 这类占位符被提交（导致 CF 证书签发 / GHCR 镜像 tag 查询静默失败）。

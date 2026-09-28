@@ -234,6 +234,60 @@ source_script() {
   [[ "$output" == *"ask_yes_no ()"* ]]
 }
 
+# ---- v3.4.0 菜单序号渲染 ----
+@test "menu_item renders one stable numeric prefix" {
+  source_script
+  C_BOLD=""; C_CYAN=""; C_RESET=""
+  run menu_item "1" "opt_lang"
+  [ "$status" -eq 0 ]
+  [ "$output" = "  1. 中英文切换" ]
+}
+
+@test "menu_item converts literal ANSI escapes with printf" {
+  source_script
+  C_BOLD="\033[1m"; C_CYAN="\033[36m"; C_RESET="\033[0m"
+  run menu_item "2" "opt_install"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'\033[1m\033[36m2.'*$'\033[0m'* ]]
+}
+
+# ---- v3.4.0 离线安装路径 ----
+@test "local_asset_path reads files from TDERP_OFFLINE_DIR" {
+  local d
+  d="$(mktemp -d)"
+  printf 'offline\n' > "$d/asset.txt"
+  source_script
+  TDERP_OFFLINE_DIR="$d" run local_asset_path asset.txt
+  [ "$status" -eq 0 ]
+  [ "$output" = "$d/asset.txt" ]
+  rm -rf "$d"
+}
+
+@test "local_docker_install_script prefers bundled Docker script" {
+  local d
+  d="$(mktemp -d)"
+  mkdir -p "$d/vendor"
+  printf '#!/bin/sh\n' > "$d/vendor/get-docker.sh"
+  source_script
+  TDERP_OFFLINE_DIR="$d" run local_docker_install_script
+  [ "$status" -eq 0 ]
+  [ "$output" = "$d/vendor/get-docker.sh" ]
+  rm -rf "$d"
+}
+
+@test "offline message keys defined in both languages" {
+  source_script
+  for k in aliyun_local_install official_local_install docker_local_script_missing \
+           compose_local_failed register_local_script first_run_local us_offline_disabled; do
+    LANG=zh run msg "$k"
+    [ "$status" -eq 0 ]
+    [ "$output" != "$k" ]
+    LANG=en run msg "$k"
+    [ "$status" -eq 0 ]
+    [ "$output" != "$k" ]
+  done
+}
+
 # ---- 镜像包路径由 GITHUB_REPO 派生（fork 友好）----
 @test "ghcr_derp_repo derives from GITHUB_REPO" {
   source_script
@@ -491,6 +545,37 @@ source_script() {
   local d; d="$(mktemp -d)"
   bash -c "DERP_DOMAIN=\"1.2.3.4\" DERP_CERT_DIR=\"$d/data/certs\" DERP_CERT_MODE=manual sh \"$BATS_TEST_DIRNAME/../entrypoint.sh\"" >/dev/null 2>&1 || true
   [ -f "$d/data/certs/1.2.3.4.crt" ]
+  rm -rf "$d"
+}
+
+@test "menu_acl pins Cloudflare Origin CA leaf via CertName" {
+  local d
+  d="$(mktemp -d)"
+  mkdir -p "$d/data/certs"
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+    -keyout "$d/data/certs/cf.example.com.key" \
+    -out "$d/data/certs/cf.example.com.crt" \
+    -subj "/CN=cf.example.com" \
+    -addext "subjectAltName=DNS:cf.example.com" >/dev/null 2>&1
+
+  run bash -c '
+    source "$1/install.sh"
+    INSTALL_DIR="$2"
+    ENV_FILE="$2/tderp.env"
+    REGION_ID=900
+    LANG=en
+    env_set "LANG" "en"
+    env_set "DERP_DOMAIN" "cf.example.com"
+    env_set "DERP_PORT" "12345"
+    env_set "STUN_PORT" "3478"
+    env_set "CERT_MODE" "manual"
+    env_set "CERT_CF" "true"
+    printf "\n" | menu_acl
+  ' _ "$BATS_TEST_DIRNAME/.." "$d"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"CertName": "sha256-raw:'* ]]
+  [[ "$output" == *"Cloudflare Origin CA certificate"* ]]
   rm -rf "$d"
 }
 

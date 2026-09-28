@@ -27,6 +27,43 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-A
 
 装完后，随时在终端输入 `tderp` 就能重新打开管理菜单。
 
+### 中国大陆 VPS：离线包安装（推荐）
+
+如果 VPS 无法稳定访问 GitHub，不要在 VPS 上执行远程脚本。先在本地
+`git clone` 项目并整包上传：
+
+```bash
+git clone https://github.com/bobvane/VPS-Tailscale-DERP-AutoSetup.git
+cd VPS-Tailscale-DERP-AutoSetup
+tar -czf /tmp/tderp-offline.tar.gz .
+scp /tmp/tderp-offline.tar.gz root@<VPS_IP>:/root/
+```
+
+登录 VPS 后解压并运行离线入口：
+
+```bash
+mkdir -p /root/tderp-offline
+tar -xzf /root/tderp-offline.tar.gz -C /root/tderp-offline
+cd /root/tderp-offline
+sudo bash install-offline.sh
+```
+
+`install-offline.sh` 只读取当前上传目录内的 `install.sh`、
+`docker-compose.yml` 和 `vendor/get-docker.sh`，安装前会检查文件名和
+所需数量是否齐全。安装流程不会回退到 GitHub。
+
+Docker 国内安装选项默认使用包内的官方 `get-docker.sh`，并以
+`--mirror Aliyun` 参数运行，因此不再实时请求 `get.docker.com`。
+
+离线包不包含 `derper` 容器镜像；安装时仍需为 `ghcr.io` 选择可用的
+加速源，或由 VPS 自行访问镜像仓库。
+
+上传后也可以只做文件检查：
+
+```bash
+sudo bash install-offline.sh --verify-only
+```
+
 ---
 
 ## 三、安装时你要做的 3 个决定
@@ -54,7 +91,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-A
 | 方案 | 需要域名 | 需要开放 80 端口 | 客户端额外配置 | 适用场景 |
 |------|---------|----------------|--------------|---------|
 | **自签名（纯 IP / 域名）** | 不需要 | 不需要 | 自动（见下方） | **无域名用户推荐** |
-| **Cloudflare Origin CA** | 需要（CF 托管） | 不需要 | 无 | 国内 VPS + CF 域名推荐 |
+| **Cloudflare Origin CA** | 需要（CF 托管） | 不需要 | CertName 指纹（自动） | 国内 VPS + CF 域名推荐 |
 | **Let's Encrypt（域名）** | 需要 | 需要 | 无 | 国外 VPS / 国内已备案域名 |
 
 ### 关于「纯 IP + 证书」的真相（重要）
@@ -65,7 +102,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-A
 - derper 内置 ACME 客户端只对接 LE，且对 SNI 与主机名做硬校验
 - 因此本项目**不提供「LE 自动纯 IP」选项**，纯 IP 场景统一走官方原生支持的**自签名（IP SAN）**方案
 
-### 自签证书如何让客户端信任（CertName 机制）
+### 自签 / CF 证书如何让客户端信任（CertName 机制）
 
 自签证书不是公共 CA 签发，客户端默认不信任。本项目采用 Tailscale 官方推荐的 **`CertName` 指纹机制**（不是已弃用的 `InsecureForTests` 测试字段）：
 
@@ -74,6 +111,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/bobvane/VPS-Tailscale-DERP-A
 3. 客户端据此指纹信任该证书，无需关闭 TLS 校验
 
 **你不用手动算**——菜单 7（`tderp acl`）会自动生成带指纹的完整配置，复制即用。
+
+Cloudflare Origin CA 同样不在 Tailscale 的默认信任库中。CF 只是负责签发
+证书，DERP 客户端仍需通过 `CertName` 固定该叶子证书的 SHA-256 指纹；
+菜单 7 会自动完成这一步。
 
 ---
 
@@ -126,7 +167,7 @@ tderp uninstall     # 完全卸载
 3. 把配置整体粘贴进去保存
 4. 重启你的 Tailscale 客户端使配置生效
 
-自签证书场景，生成的节点会自动带上 `CertName` 指纹，例如：
+manual 证书场景（自签或 CF），生成的节点会自动带上 `CertName` 指纹，例如：
 
 ```json
 {
@@ -155,11 +196,13 @@ tderp uninstall     # 完全卸载
 ```
 
 > `OmitDefaultRegions: false` 保留 Tailscale 官方节点作兜底；想只用你的中继改成 `true`。
-> CF Origin CA / Let's Encrypt 证书由公共 CA 签发，客户端原生信任，**节点无需任何额外字段**。
+> Let's Encrypt 证书使用公共信任链，节点无需额外字段。CF Origin CA 不是默认受信任的公共
+> CA，节点必须保留菜单 7 生成的 `CertName` 指纹。
 
-### 客户端验证（自签场景必走这 3 步）
+### 客户端验证（自签 / CF 场景必走这 3 步）
 
-**不要只复制 ACL 就以为完事。** 自签证书的信任依赖客户端版本与 `CertName` 字段支持，按下面 3 步逐步验证：
+**不要只复制 ACL 就以为完事。** 自签和 CF Origin CA 的信任依赖客户端版本
+与 `CertName` 字段支持，按下面 3 步逐步验证：
 
 1. **跑 `tderp acl` 输出 ACL**，复制到 Tailscale 管理后台保存
 2. **重启 Tailscale 客户端**使配置生效
@@ -215,6 +258,9 @@ LE / CF 模式自动续期或长期有效。自签名有效期 10 年，到期�
 **Q: 如何更新 tderp 管理脚本本身？**
 菜单 `u`，或命令行 `tderp updatescript`。脚本从多源（ghproxy→jsDelivr→raw）下载最新版，校验语法后替换，失败保留原版。
 
+离线安装模式下会禁用菜单 `u` / `tderp updatescript`，避免意外访问 GitHub。
+重新下载或 clone 新版本项目，上传后再次运行 `install-offline.sh` 即可更新。
+
 ---
 
 ## 九、已知限制
@@ -230,6 +276,8 @@ LE / CF 模式自动续期或长期有效。自签名有效期 10 年，到期�
 
 ```
 ├── install.sh                # 一键安装 + 管理脚本（核心，单文件）
+├── install-offline.sh        # 离线安装入口：本地文件检查 + 禁止 GitHub 回退
+├── vendor/get-docker.sh      # 随包分发的 Docker 官方安装脚本
 ├── Dockerfile                # 多阶段构建 derper 镜像
 ├── entrypoint.sh             # 容器入口：证书生成 + 启动参数
 ├── docker-compose.yml        # compose 模板（变量驱动）
